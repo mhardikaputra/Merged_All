@@ -1,0 +1,299 @@
+"""
+merge_all_sheets.py
+===================
+One script that replaces the three original standalone mergers:
+
+    1. "Raw Data"          -> Rocket "Raw Data"          + Papero "RAW DATA"
+    2. "SKU Data"          -> Rocket "Raw SKU Data"      + Papero "RAW SKU DATA"
+    3. "Operating Details" -> Rocket "Operating Details" + Papero "OPERATING DETAILS"
+
+The three originals were ~95% identical: same auth, same parse_number(),
+same Column-B cleanup, same chunked upload. Everything that actually
+differed now lives in the JOBS config below — the merge engine itself is
+written exactly once.
+
+Usage
+-----
+    python merge_all_sheets.py              # run all three jobs
+    python merge_all_sheets.py sku          # run a single job
+    python merge_all_sheets.py raw sku      # run selected jobs
+
+Requires the GCP_CREDENTIALS environment variable to hold the
+service-account JSON (e.g. stored as a GitHub Actions secret).
+"""
+
+import argparse
+import json
+import os
+import re
+import time
+
+import gspread
+import pandas as pd
+from google.oauth2.service_account import Credentials
+
+
+# ----------------------------------------------------------------------
+# Number parsing — shared by every job (unchanged from the originals)
+# ----------------------------------------------------------------------
+def parse_number(val):
+    if val is None:
+        return ''
+    if not isinstance(val, (str, int, float)):
+        return val
+    if isinstance(val, (int, float)):
+        return val
+
+    # 1. Strip surrounding quotes, apostrophes, and invisible spaces
+    s = str(val).strip().strip("'").strip('"').replace('\xa0', '').replace('\u200b', '')
+    if not s or s.lower() in ['nan', 'none', 'null', '']:
+        return ''
+
+    # 2. Strip currency symbols (Rp, $, etc.)
+    clean_s = re.sub(r'^[Rp\$€\s]+', '', s, flags=re.IGNORECASE).strip()
+
+    # 3. Indonesian format with decimal comma (e.g., '10808763,54 or 10.808.763,54)
+    if re.match(r'^-?\d{1,3}(\.\d{3})*,\d+$', clean_s) or re.match(r'^-?\d+,\d+$', clean_s):
+        num_str = clean_s.replace('.', '').replace(',', '.')
+        try:
+            return float(num_str)
+        except ValueError:
+            pass
+    # 4. US format with decimal dot (e.g., 10,808,763.54 or 10808763.54)
+    if re.match(r'^-?\d{1,3}(,\d{3})*\.\d+$', clean_s) or re.match(r'^-?\d+\.\d+$', clean_s):
+        num_str = clean_s.replace(',', '')
+        try:
+            return float(num_str)
+        except ValueError:
+            pass
+    # 5. Integer with Indonesian thousands dots (e.g., 10.808.763)
+    if re.match(r'^-?\d{1,3}(\.\d{3})+$', clean_s):
+        num_str = clean_s.replace('.', '')
+        try:
+            return int(num_str)
+        except ValueError:
+            pass
+    # 6. Integer with US thousands commas (e.g., 10,808,763)
+    if re.match(r'^-?\d{1,3}(,\d{3})+$', clean_s):
+        num_str = clean_s.replace(',', '')
+        try:
+            return int(num_str)
+        except ValueError:
+            pass
+    # 7. Pure integer (e.g., 10808763)
+    if re.match(r'^-?\d+$', clean_s):
+        try:
+            return int(clean_s)
+        except ValueError:
+            pass
+    # Return original string if it is plain text
+    return val
+
+
+def apply_elementwise(df, func):
+    """Applies a function cell-by-cell across the entire DataFrame safely, regardless of duplicate column names."""
+    if hasattr(df, 'map'):
+        return df.map(func)
+    else:
+        return df.applymap(func)
+
+
+# ----------------------------------------------------------------------
+# Job configuration — everything that differed between the 3 scripts
+# ----------------------------------------------------------------------
+ROCKET_SHEET = "https://docs.google.com/spreadsheets/d/1a6gdPuWWeIqcdw5YnUQBHppHt_OkZ2yNw_Fi5iPhSvg/edit"
+PAPERO_SHEET = "https://docs.google.com/spreadsheets/d/1s8Xzfr3OdD1Ty3HScdVUB9bNHQxXtwGf0N7HnztNFfM/edit"
+
+JOBS = {
+    # --- Original script 1: "Raw Data" --------------------------------
+    "raw": {
+        "title": "Raw Data",
+        "sources": [
+            # Rocket's raw export keeps a large historical block above the
+            # live data, so its first data row is index 8808, not 1.
+            {"spreadsheet": ROCKET_SHEET, "worksheet": "Raw Data", "label": "Rocket", "first_data_row": 8808},
+            {"spreadsheet": PAPERO_SHEET, "worksheet": "RAW DATA", "label": "Papero", "first_data_row": 1},
+        ],
+        "dest_spreadsheet": "https://docs.google.com/spreadsheets/d/1VfbKcNo8In9poUbsKKnZ-xjD3WZ3u0iXV6fKiR8OU6o/edit",
+        "dest_worksheet": "Merged Raw",
+        "text_columns": [],            # columns parse_number() must never touch
+        "add_source_column": True,
+        "value_input_option": "USER_ENTERED",
+    },
+
+    # --- Original script 2: SKU data ----------------------------------
+    "sku": {
+        "title": "SKU Data",
+        "sources": [
+            {"spreadsheet": ROCKET_SHEET, "worksheet": "Raw SKU Data", "label": "Rocket", "first_data_row": 1},
+            {"spreadsheet": PAPERO_SHEET, "worksheet": "RAW SKU DATA", "label": "Papero", "first_data_row": 1},
+        ],
+        "dest_spreadsheet": "https://docs.google.com/spreadsheets/d/1zkzqgapuj9Wlww-xOW2KUI7L_r5m329NXDIXBvvFo4E/edit",
+        "dest_worksheet": "Merged SKU",
+        # SKUs such as 01-04-2025 must stay text: they are excluded from
+        # number parsing, forced to str, and uploaded with RAW so Google
+        # Sheets cannot re-interpret them as dates. Parsed numbers in the
+        # other columns are still sent as native ints/floats.
+        "text_columns": ["SKU"],
+        "add_source_column": True,
+        "value_input_option": "RAW",
+    },
+
+    # --- Original script 3: Operating Details --------------------------
+    "operating": {
+        "title": "Operating Details",
+        "sources": [
+            {"spreadsheet": ROCKET_SHEET, "worksheet": "Operating Details", "label": None, "first_data_row": 1},
+            {"spreadsheet": PAPERO_SHEET, "worksheet": "OPERATING DETAILS", "label": None, "first_data_row": 1},
+        ],
+        "dest_spreadsheet": "https://docs.google.com/spreadsheets/d/1l7C4peJzC9tyv9ZP96mNPPbVibqDP53r3uL6tzA-xW8/edit",
+        "dest_worksheet": "Merged Operating Details",
+        "text_columns": [],
+        "add_source_column": False,    # this original never had a Source column
+        "value_input_option": "USER_ENTERED",
+    },
+}
+
+CHUNK_SIZE = 10000
+
+
+# ----------------------------------------------------------------------
+# Merge engine — written once, driven by the config above
+# ----------------------------------------------------------------------
+_spreadsheet_cache = {}
+
+
+def get_worksheet(client, spreadsheet_url, worksheet_name):
+    """Open a worksheet, caching the spreadsheet so Rocket's and Papero's
+    files are only opened once even though three jobs read from them."""
+    if spreadsheet_url not in _spreadsheet_cache:
+        _spreadsheet_cache[spreadsheet_url] = client.open_by_url(spreadsheet_url)
+    return _spreadsheet_cache[spreadsheet_url].worksheet(worksheet_name)
+
+
+def download_frame(client, source):
+    ws = get_worksheet(client, source["spreadsheet"], source["worksheet"])
+    data = ws.get_all_values()
+    # Row 0 is always the header; first_data_row says where data begins.
+    return pd.DataFrame(data[source["first_data_row"]:], columns=data[0])
+
+
+def prepare_frame(client, source, text_columns, add_source_column):
+    """Download one source sheet, convert text numbers to native numbers
+    (skipping protected text columns), and tag rows with their source."""
+    print(f"Downloading data ({source['worksheet']})...")
+    df = download_frame(client, source)
+
+    print("Converting text numbers to native floats...")
+    if text_columns:
+        cols_to_parse = [c for c in df.columns if c not in text_columns]
+        df[cols_to_parse] = df[cols_to_parse].map(parse_number)
+        for col in text_columns:
+            if col in df.columns:
+                df[col] = df[col].astype(str)
+    else:
+        df = apply_elementwise(df, parse_number)
+
+    if add_source_column and source.get("label"):
+        df["Source"] = source["label"]
+    return df
+
+
+def clean_merged(merged_df):
+    """Strict cleanup based on Column B (positional index iloc[:, 1])."""
+    print("Cleaning out blank rows...")
+    col_b_series = merged_df.iloc[:, 1]
+    valid_mask = (
+        (col_b_series.astype(str).str.strip() != '') &
+        (col_b_series.astype(str).str.lower() != 'nan') &
+        (col_b_series.astype(str).str.lower() != 'none')
+    )
+    merged_df = merged_df[valid_mask]
+    merged_df.reset_index(drop=True, inplace=True)
+    return merged_df
+
+
+def build_upload_matrix(merged_df):
+    """Prepare the upload payload, preserving native float types."""
+    print("Preparing upload payload...")
+    upload_data = [merged_df.columns.tolist()]
+    for row in merged_df.values.tolist():
+        clean_row = []
+        for item in row:
+            if pd.isna(item) or item is None or str(item).lower() in ['nan', 'none', 'null']:
+                clean_row.append('')
+            elif isinstance(item, (int, float)):
+                clean_row.append(item)
+            else:
+                clean_row.append(item)
+        upload_data.append(clean_row)
+    return upload_data
+
+
+def upload(dest_sheet, upload_data, value_input_option):
+    # Resize destination sheet if needed
+    total_rows_needed = len(upload_data)
+    print(f"Resizing destination sheet to {total_rows_needed} rows...")
+    if total_rows_needed > dest_sheet.row_count:
+        dest_sheet.add_rows(total_rows_needed - dest_sheet.row_count)
+
+    # Upload to destination in chunks
+    print(f"Preparing to upload {len(upload_data) - 1} data rows...")
+    dest_sheet.clear()
+    for i in range(0, len(upload_data), CHUNK_SIZE):
+        chunk = upload_data[i:i + CHUNK_SIZE]
+        start_row = i + 1
+        dest_sheet.update(range_name=f'A{start_row}', values=chunk, value_input_option=value_input_option)
+        print(f"Uploaded rows {start_row} to {start_row + len(chunk) - 1}")
+        time.sleep(2)
+
+
+def run_job(client, job):
+    print(f"\n{'=' * 60}\nJOB: {job['title']}\n{'=' * 60}")
+    frames = [
+        prepare_frame(client, src, job["text_columns"], job["add_source_column"])
+        for src in job["sources"]
+    ]
+    merged_df = clean_merged(pd.concat(frames, ignore_index=True))
+    upload_data = build_upload_matrix(merged_df)
+    dest_sheet = get_worksheet(client, job["dest_spreadsheet"], job["dest_worksheet"])
+    upload(dest_sheet, upload_data, job["value_input_option"])
+    print(f"Success! {job['title']} merged and uploaded.")
+
+
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Merge Rocket + Papero Google Sheets.")
+    parser.add_argument(
+        "jobs", nargs="*", metavar="JOB",
+        help="Job keys to run: raw, sku, operating (default: run all three)",
+    )
+    args = parser.parse_args()
+
+    selected = args.jobs or list(JOBS)
+    unknown = [key for key in selected if key not in JOBS]
+    if unknown:
+        parser.error(f"unknown job(s): {', '.join(unknown)} — choose from {', '.join(JOBS)}")
+
+    # Load credentials securely from environment (GitHub Secret)
+    creds_json = os.environ.get('GCP_CREDENTIALS')
+    if not creds_json:
+        raise RuntimeError("GCP_CREDENTIALS environment variable is not set.")
+    creds_dict = json.loads(creds_json)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+
+    for key in selected:
+        run_job(client, JOBS[key])
+
+    print("\nAll jobs finished.")
+
+
+if __name__ == "__main__":
+    main()
