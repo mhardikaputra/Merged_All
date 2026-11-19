@@ -26,4 +26,4 @@ jobs:
       env:
         # This passes the secret to the Python script
         GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }} 
-      run: python merge_sheets.py
+      run: python merged_all.py
