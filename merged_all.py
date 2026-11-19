@@ -1,3 +1,27 @@
+"""
+merged_all.py
+=============
+One script that replaces the three original standalone mergers:
+
+    1. "Raw Data"          -> Rocket "Raw Data"          + Papero "RAW DATA"
+    2. "SKU Data"          -> Rocket "Raw SKU Data"      + Papero "RAW SKU DATA"
+    3. "Operating Details" -> Rocket "Operating Details" + Papero "OPERATING DETAILS"
+
+The three originals were ~95% identical: same auth, same parse_number(),
+same Column-B cleanup, same chunked upload. Everything that actually
+differed now lives in the JOBS config below — the merge engine itself is
+written exactly once.
+
+Usage
+-----
+    python merged_all.py              # run all three jobs
+    python merged_all.py sku          # run a single job
+    python merged_all.py raw sku      # run selected jobs
+
+Requires the GCP_CREDENTIALS environment variable to hold the
+service-account JSON (e.g. stored as a GitHub Actions secret).
+"""
+
 import argparse
 import json
 import os
@@ -163,7 +187,7 @@ def prepare_frame(client, source, text_columns, add_source_column):
     print("Converting text numbers to native floats...")
     if text_columns:
         cols_to_parse = [c for c in df.columns if c not in text_columns]
-        df[cols_to_parse] = df[cols_to_parse].map(parse_number)
+        df[cols_to_parse] = apply_elementwise(df[cols_to_parse], parse_number)
         for col in text_columns:
             if col in df.columns:
                 df[col] = df[col].astype(str)
